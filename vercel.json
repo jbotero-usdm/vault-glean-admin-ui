@@ -1,12 +1,13 @@
 {
+  "functions": {
+    "api/sync.py": { "maxDuration": 800 },
+    "api/audit.py": { "maxDuration": 300 },
+    "api/monitor.py": { "maxDuration": 600 },
+    "api/cron/sync.py": { "maxDuration": 800 },
+    "api/cron/monitor.py": { "maxDuration": 600 }
+  },
   "crons": [
-    {
-      "path": "/api/cron/sync",
-      "schedule": "0 6 * * *"
-    },
-    {
-      "path": "/api/cron/monitor",
-      "schedule": "30 6 * * *"
-    }
+    { "path": "/api/cron/sync", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/monitor", "schedule": "30 6 * * *" }
   ]
 }
