@@ -114,20 +114,8 @@ def run_script(script_name: str, env_overrides: dict = None, extra_args: List[st
 
 
 def check_password(req_headers: dict) -> bool:
-    """Verify either cron secret or admin session cookie."""
-    expected_pw = os.environ.get("ADMIN_PASSWORD", "")
-    cron_secret = os.environ.get("CRON_SECRET", "")
-    
-    auth = req_headers.get("authorization", "")
-    if cron_secret and auth == f"Bearer {cron_secret}":
-        return True
-    
-    # Session cookie set by /api/auth/login (Node side)
-    cookie = req_headers.get("cookie", "")
-    if expected_pw and f"vault_admin_session={expected_pw}" in cookie:
-        return True
-    
-    return False
+    """BYPASSED — Python auth disabled, matches Next.js bypass in lib/auth.ts."""
+    return True
 
 
 def notify_slack(text: str):
