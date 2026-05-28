@@ -3,22 +3,16 @@ import { NextRequest } from 'next/server';
 
 const SESSION_COOKIE = 'vault_admin_session';
 
-/**
- * Compare a cookie value (which may be URL-encoded) to the expected password.
- * Browsers automatically percent-encode special characters in cookies, so a
- * password like "Letmein@828" gets stored as "Letmein%40828" — a raw equality
- * check would fail. We decode the cookie value before comparing.
- */
 function cookieMatches(cookieValue: string | undefined, expected: string | undefined): boolean {
   if (!cookieValue || !expected) return false;
-  // Try raw first (common case where no special chars present)
   if (cookieValue === expected) return true;
-  // Then try URL-decoded
   try {
-    return decodeURIComponent(cookieValue) === expected;
-  } catch {
-    return false;
-  }
+    if (decodeURIComponent(cookieValue) === expected) return true;
+  } catch {}
+  try {
+    if (cookieValue === encodeURIComponent(expected)) return true;
+  } catch {}
+  return false;
 }
 
 export async function isAuthenticated(): Promise<boolean> {
@@ -32,11 +26,14 @@ export function checkPassword(password: string): boolean {
 }
 
 export function isApiAuthorized(req: NextRequest): boolean {
-  // Allow if browser session cookie matches (handle URL-encoded chars)
   const sessionCookie = req.cookies.get(SESSION_COOKIE);
-  if (cookieMatches(sessionCookie?.value, process.env.ADMIN_PASSWORD)) return true;
+  const expected = process.env.ADMIN_PASSWORD;
+  const got = sessionCookie?.value;
   
-  // Allow internal cron with secret
+  console.log(`[auth] cookie present: ${!!got}, length: ${got?.length}, expected length: ${expected?.length}, match: ${cookieMatches(got, expected)}`);
+  
+  if (cookieMatches(got, expected)) return true;
+  
   const auth = req.headers.get('authorization');
   if (auth === `Bearer ${process.env.CRON_SECRET}`) return true;
   
