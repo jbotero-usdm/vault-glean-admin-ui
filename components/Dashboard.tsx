@@ -59,15 +59,35 @@ export default function Dashboard() {
   async function fetchJobs() {
     setRefreshing(true);
     try {
-      const res = await fetch('/api/jobs', { credentials: 'include' });
-      if (res.ok) {
-        const data = await res.json();
-        setJobs(Array.isArray(data) ? data : []);
-      }
+      // Load jobs from localStorage (persistent across page reloads).
+      // We don't call /api/jobs because Vercel /tmp is wiped between invocations.
+      const stored = localStorage.getItem('vault_admin_jobs');
+      const localJobs: Job[] = stored ? JSON.parse(stored) : [];
+      setJobs(localJobs);
     } catch (e) {
-      console.error('Failed to fetch jobs:', e);
+      console.error('Failed to load jobs from localStorage:', e);
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  function saveJob(job: Job) {
+    try {
+      const stored = localStorage.getItem('vault_admin_jobs');
+      const existing: Job[] = stored ? JSON.parse(stored) : [];
+      // Update if exists, prepend if new
+      const idx = existing.findIndex(j => j.jobId === job.jobId);
+      if (idx >= 0) {
+        existing[idx] = job;
+      } else {
+        existing.unshift(job);
+      }
+      // Keep last 20
+      const trimmed = existing.slice(0, 20);
+      localStorage.setItem('vault_admin_jobs', JSON.stringify(trimmed));
+      setJobs(trimmed);
+    } catch (e) {
+      console.error('Failed to save job to localStorage:', e);
     }
   }
   
@@ -122,7 +142,17 @@ export default function Dashboard() {
         } catch {}
         alert(`Failed: ${errMsg}`);
       } else {
-        await fetchJobs();
+        // The response body IS the job record — save it client-side
+        try {
+          const job = await res.json();
+          if (job && job.jobId) {
+            saveJob(job);
+          } else {
+            await fetchJobs();
+          }
+        } catch {
+          await fetchJobs();
+        }
       }
     } catch (e: any) {
       alert(`Failed: ${e.message}`);
