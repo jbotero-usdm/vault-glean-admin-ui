@@ -9,16 +9,12 @@ What this script does
 - Indexes Vault users into the SAME datasource before applying ACLs
 - Resolves document/object ACLs from Vault live role APIs
 - Expands Vault groups to user emails
-- INCLUDES dynamic access control from user_role_setup__v for object records
-  (because the per-record /roles API does NOT return URS-granted users)
 - Indexes changed documents and objects with permissions.allowedUsers
 
-Why URS expansion is required for objects
-- Vault QMS objects use dynamic security via user_role_setup__v + application_role__v
-- A user can have read access to ALL records of an object type via URS, but the
-  per-record /vobjects/{name}/{id}/roles endpoint will NOT list them
-- Without URS expansion, the script would push allowedUsers = [creator only],
-  making the records invisible in Glean to users who can actually see them in Vault
+Why there is a periodic full reconcile
+- The Vault Direct Data docs used here clearly support full and incremental files, but they do
+  not explicitly document deletion tombstones in the extract format in the context we used.
+- Glean's documented bulk replacement model safely removes stale documents during reconcile.
 
 Defaults
 - STRICT_ACL defaults to true
@@ -76,20 +72,6 @@ FULL_RECONCILE_HOURS = int(os.getenv("FULL_RECONCILE_HOURS", "24"))
 FORCE_FULL_RECONCILE = os.getenv("FORCE_FULL_RECONCILE", "false").lower() == "true"
 REFRESH_DATA = os.getenv("REFRESH_DATA", "true").lower() == "true"
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
-
-# When True, applies URS-derived emails to object permissions even if per-record
-# /vobjects/.../roles returns no users beyond the owner. This honestly reflects
-# who can actually see the record in Vault. Set false to disable URS expansion.
-EXPAND_URS_FOR_OBJECTS = os.getenv("EXPAND_URS_FOR_OBJECTS", "true").lower() == "true"
-
-# URS roles that grant READ access — used to filter which URS records imply visibility.
-# Default covers the common Vault read-access roles. Extend if you have custom roles.
-URS_READ_ROLE_NAMES = set(
-    os.getenv(
-        "URS_READ_ROLE_NAMES",
-        "viewer,consumer,reviewer,owner,editor,coordinator,approver,qa,available_qa,document_change_control_reviewer,document_change_control_approver,periodic_reviewer,trainee,process_viewer",
-    ).lower().split(",")
-)
 
 DOWNLOAD_DIR = Path("downloads")
 WORK_DIR = Path("data")
@@ -392,12 +374,10 @@ def get_user_map(session, vault_headers):
         email = str(user.get("user_name__v", "")).strip().lower()
         first = str(user.get("user_first_name__v", "")).strip()
         last = str(user.get("user_last_name__v", "")).strip()
-        active = user.get("active__v", False)
         if user_id and email and "@" in email:
             user_map[user_id] = {
                 "email": email,
                 "name": f"{first} {last}".strip() or email,
-                "active": bool(active),
             }
     return user_map
 
@@ -426,100 +406,6 @@ def get_group_map(session, vault_headers):
             "members": sorted(set(direct_members + implied_members)),
         }
     return group_map
-
-
-def get_urs_map(session, vault_headers, user_map):
-    """Load user_role_setup__v (and the QMS-specific user_role_setup_qms__c if present).
-    
-    These records grant users dynamic access to object records via their assigned
-    application role. The per-record /vobjects/{name}/{id}/roles endpoint does NOT
-    return URS-granted users, so we read these directly.
-    
-    Returns a list of dicts: [{role_id, role_name, user_id, email}, ...]
-    Filtered to records with status=active and where the user is known + active.
-    """
-    if not EXPAND_URS_FOR_OBJECTS:
-        return []
-    
-    urs_records = []
-    
-    # Query the system URS object
-    for object_name in ["user_role_setup__v", "user_role_setup_qms__c"]:
-        try:
-            vql = f"SELECT id, user__v, role__v, status__v FROM {object_name}"
-            resp = session.post(
-                f"https://{VAULT_DNS}/api/{API_VERSION}/query",
-                headers={**vault_headers, "Content-Type": "application/x-www-form-urlencoded"},
-                data={"q": vql},
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                continue
-            
-            for row in resp.json().get("data", []):
-                status = row.get("status__v")
-                if isinstance(status, list):
-                    status = status[0] if status else ""
-                if status != "active__v":
-                    continue
-                
-                user_id = str(row.get("user__v") or "")
-                role_id = str(row.get("role__v") or "")
-                if not user_id or not role_id:
-                    continue
-                
-                user_info = user_map.get(user_id)
-                if not user_info or not user_info.get("active"):
-                    continue
-                
-                urs_records.append({
-                    "role_id": role_id,
-                    "user_id": user_id,
-                    "email": user_info["email"],
-                    "source_object": object_name,
-                })
-        except Exception as e:
-            print(f"  ⚠ URS query on {object_name} failed: {e}")
-    
-    return urs_records
-
-
-def get_role_definitions(session, vault_headers, role_ids):
-    """Resolve application_role__v IDs to names so we can filter to read roles only."""
-    if not role_ids:
-        return {}
-    
-    role_id_list = ",".join(f"'{r}'" for r in sorted(set(role_ids)))
-    vql = f"SELECT id, name__v FROM application_role__v WHERE id CONTAINS ({role_id_list})"
-    
-    try:
-        resp = session.post(
-            f"https://{VAULT_DNS}/api/{API_VERSION}/query",
-            headers={**vault_headers, "Content-Type": "application/x-www-form-urlencoded"},
-            data={"q": vql},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code == 200:
-            return {r["id"]: (r.get("name__v") or "").lower() for r in resp.json().get("data", [])}
-    except Exception:
-        pass
-    
-    return {}
-
-
-def build_urs_email_pool(urs_records, role_name_by_id):
-    """Filter URS records to only those granting read access, return set of emails."""
-    emails = set()
-    for r in urs_records:
-        role_name = role_name_by_id.get(r["role_id"], "").lower()
-        if not role_name:
-            # Unknown role — include conservatively (better to over-share to known
-            # active users than to silently drop)
-            emails.add(r["email"])
-            continue
-        if role_name in URS_READ_ROLE_NAMES:
-            emails.add(r["email"])
-    return emails
 
 
 def compute_topology_hash(user_map, group_map):
@@ -611,42 +497,31 @@ def get_document_permissions(session, vault_headers, doc_id, row, user_map, grou
     return make_permissions_from_emails(emails, fallback=ACL_FALLBACK)
 
 
-def get_object_permissions(session, vault_headers, object_name, object_id, row, user_map, group_map, urs_email_pool):
-    """Build object ACL by UNIONing per-record roles + URS-granted users.
-    
-    Per-record /vobjects/{name}/{id}/roles only returns explicit role assignments
-    (typically just owner__v). URS records grant additional dynamic access that
-    must be merged in to reflect actual Vault visibility.
-    """
-    emails = []
-    
+def get_object_permissions(session, vault_headers, object_name, object_id, row, user_map, group_map):
     resp = session.get(
         f"https://{VAULT_DNS}/api/{API_VERSION}/vobjects/{object_name}/{object_id}/roles",
         headers=vault_headers,
         timeout=REQUEST_TIMEOUT,
     )
-    
-    if resp.status_code == 200:
-        roles = safe_list(resp.json().get("data"))
-        for role in roles:
-            for uid in safe_list(role.get("users")):
-                user = user_map.get(str(uid))
-                if user:
-                    emails.append(user["email"])
-            emails.extend(expand_group_ids_to_user_emails(role.get("groups"), group_map, user_map))
-    
-    # UNION with URS-granted users (dynamic access control)
-    if EXPAND_URS_FOR_OBJECTS and urs_email_pool:
-        for e in urs_email_pool:
-            if e not in emails:
-                emails.append(e)
-    
+    if resp.status_code != 200:
+        fallback_emails = fallback_user_emails_from_row(row, user_map)
+        return make_permissions_from_emails(fallback_emails, fallback=ACL_FALLBACK)
+
+    roles = safe_list(resp.json().get("data"))
+    emails = []
+    for role in roles:
+        for uid in safe_list(role.get("users")):
+            user = user_map.get(str(uid))
+            if user:
+                emails.append(user["email"])
+        emails.extend(expand_group_ids_to_user_emails(role.get("groups"), group_map, user_map))
+
     if not normalize_emails(emails):
         if ACL_FALLBACK == "owner_creator":
             emails = fallback_user_emails_from_row(row, user_map)
             return make_permissions_from_emails(emails, fallback="anonymous")
         return make_permissions_from_emails([], fallback=ACL_FALLBACK)
-    
+
     return make_permissions_from_emails(emails, fallback=ACL_FALLBACK)
 
 
@@ -695,7 +570,7 @@ def build_document_payload(row, session, vault_headers, user_map, group_map):
     }
 
 
-def build_object_payload(row, object_type, object_name, source_csv_name, session, vault_headers, user_map, group_map, urs_email_pool):
+def build_object_payload(row, object_type, object_name, source_csv_name, session, vault_headers, user_map, group_map):
     object_id = clean_value(row.get("id"))
     if not object_id:
         return None
@@ -704,7 +579,7 @@ def build_object_payload(row, object_type, object_name, source_csv_name, session
     status = clean_value(row.get("status__v"))
     state = clean_value(row.get("state__v"))
 
-    permissions = get_object_permissions(session, vault_headers, object_name, object_id, row, user_map, group_map, urs_email_pool)
+    permissions = get_object_permissions(session, vault_headers, object_name, object_id, row, user_map, group_map)
     if STRICT_ACL and permissions is None:
         return None
     if permissions is None:
@@ -735,7 +610,7 @@ def build_object_payload(row, object_type, object_name, source_csv_name, session
     }
 
 
-def build_all_payloads(extract_dir, session, vault_headers, user_map, group_map, urs_email_pool, object_csv_map):
+def build_all_payloads(extract_dir, session, vault_headers, user_map, group_map, object_csv_map):
     payloads = []
 
     doc_csv = find_csv(extract_dir, DOCUMENT_CSV_NAME)
@@ -763,7 +638,7 @@ def build_all_payloads(extract_dir, session, vault_headers, user_map, group_map,
             print(f" - Found {len(obj_df)} rows in {csv_path}")
             for _, row in obj_df.iterrows():
                 try:
-                    payload = build_object_payload(row, object_type, object_name, csv_name, session, vault_headers, user_map, group_map, urs_email_pool)
+                    payload = build_object_payload(row, object_type, object_name, csv_name, session, vault_headers, user_map, group_map)
                     if payload:
                         payloads.append(payload)
                 except Exception as e:
@@ -862,24 +737,12 @@ def main():
     vault_headers = {"Authorization": sid}
     print("✓ Authenticated")
 
-    print("\n[2/8] Loading Vault users, groups, and dynamic access control (URS)...")
+    print("\n[2/8] Loading Vault users and groups...")
     user_map = get_user_map(session, vault_headers)
     group_map = get_group_map(session, vault_headers)
-    
-    urs_records = get_urs_map(session, vault_headers, user_map)
-    role_ids = list({r["role_id"] for r in urs_records})
-    role_name_by_id = get_role_definitions(session, vault_headers, role_ids)
-    urs_email_pool = build_urs_email_pool(urs_records, role_name_by_id)
-    
     topology_hash = compute_topology_hash(user_map, group_map)
     print(f"✓ Users loaded: {len(user_map)}")
     print(f"✓ Groups loaded: {len(group_map)}")
-    print(f"✓ URS records loaded: {len(urs_records)}")
-    print(f"✓ URS-granted readers (after filter to read roles): {len(urs_email_pool)}")
-    if EXPAND_URS_FOR_OBJECTS:
-        print(f"  URS expansion: ENABLED — objects will include URS-granted users in allowedUsers")
-    else:
-        print(f"  URS expansion: DISABLED (set EXPAND_URS_FOR_OBJECTS=true to enable)")
 
     now = now_utc()
     stop_time = fmt_ts(now)
@@ -935,7 +798,7 @@ def main():
             print(f"✓ User indexing errors: {user_errors}")
 
             print("\n[6/8] Building full reconcile payloads...")
-            payloads = build_all_payloads(reconcile_dir, session, vault_headers, user_map, group_map, urs_email_pool, object_csv_map)
+            payloads = build_all_payloads(reconcile_dir, session, vault_headers, user_map, group_map, object_csv_map)
             print(f"✓ Prepared {len(payloads)} total payloads for reconcile")
 
             print("\n[7/8] Bulk replacing datasource contents...")
@@ -953,7 +816,6 @@ def main():
             print(f"Users indexed: {user_indexed}")
             print(f"Documents+objects bulk indexed: {indexed}")
             print(f"ACL fallback mode: {ACL_FALLBACK}")
-            print(f"URS-derived emails included in object ACLs: {len(urs_email_pool)}")
             print(f"Checkpoint advanced to: {stop_time}")
             print("=" * 80)
             return
@@ -996,7 +858,7 @@ def main():
     print(f"✓ User indexing errors: {user_errors}")
 
     print("\n[6/8] Building incremental payloads...")
-    payloads = build_all_payloads(incremental_dir, session, vault_headers, user_map, group_map, urs_email_pool, object_csv_map)
+    payloads = build_all_payloads(incremental_dir, session, vault_headers, user_map, group_map, object_csv_map)
     print(f"✓ Prepared {len(payloads)} changed payloads")
 
     print("\n[7/8] Indexing changed documents/objects...")
@@ -1024,7 +886,6 @@ def main():
     print(f"Changed documents+objects indexed: {indexed}")
     print(f"Errors: {errors}")
     print(f"ACL fallback mode: {ACL_FALLBACK}")
-    print(f"URS-derived emails included in object ACLs: {len(urs_email_pool)}")
     print(f"Checkpoint advanced from {start_time} to {stop_time}")
     print("=" * 80)
 
